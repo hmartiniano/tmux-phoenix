@@ -170,23 +170,41 @@ validate_snapshot() {
     }' "$file"
 }
 
+is_boilerplate_conf() {
+    local conf="$1"
+    local non_script_lines
+    non_script_lines=$(sed '/# BEGIN TMUX-PHOENIX/,/# END TMUX-PHOENIX/d; /# BEGIN TMUX PERSISTENCE/,/# END TMUX PERSISTENCE/d; /tpm\/tpm/d; /tmux-sensible/d; /TMUX_PLUGIN_MANAGER_PATH/d; /destroy-unattached/d; /exit-unattached/d; /^[[:space:]]*#/d; /^[[:space:]]*$/d' "$conf" | awk 'END {print NR+0}')
+    [ "$non_script_lines" -eq 0 ]
+}
+
 resolve_tmux_conf() {
-    if [ -f "$XDG_CONF" ]; then
-        if [ -f "$LEGACY_CONF" ]; then
-            local non_script_lines
-            non_script_lines=$(sed '/# BEGIN TMUX-PHOENIX/,/# END TMUX-PHOENIX/d; /# BEGIN TMUX PERSISTENCE/,/# END TMUX PERSISTENCE/d; /tpm\/tpm/d; /TMUX_PLUGIN_MANAGER_PATH/d; /destroy-unattached/d; /exit-unattached/d; /^[[:space:]]*$/d' "$LEGACY_CONF" | awk 'END {print NR+0}')
-            if [ "$non_script_lines" -eq 0 ]; then
-                rm -f "$LEGACY_CONF"
-                echo "$XDG_CONF"
-                return
-            fi
-            echo "$LEGACY_CONF"
-            return
-        fi
+    if [ -f "$LEGACY_CONF" ]; then
+        echo "$LEGACY_CONF"
+    elif [ -f "$XDG_CONF" ]; then
         echo "$XDG_CONF"
     else
         echo "$LEGACY_CONF"
     fi
+}
+
+reconcile_tmux_conf() {
+    if [ -f "$XDG_CONF" ] && [ -f "$LEGACY_CONF" ]; then
+        if is_boilerplate_conf "$LEGACY_CONF"; then
+            rm -f "$LEGACY_CONF"
+            echo "$XDG_CONF"
+            return
+        elif is_boilerplate_conf "$XDG_CONF"; then
+            rm -f "$XDG_CONF"
+            echo "$LEGACY_CONF"
+            return
+        else
+            mv -f "$XDG_CONF" "${XDG_CONF}.bak"
+            echo "Moved conflicting ${XDG_CONF} -> ${XDG_CONF}.bak so tmux and TPM use ${LEGACY_CONF}" >&2
+            echo "$LEGACY_CONF"
+            return
+        fi
+    fi
+    resolve_tmux_conf
 }
 
 cmd_list() {
@@ -470,6 +488,13 @@ cmd_doctor() {
     fi
 
     tmux_conf=$(resolve_tmux_conf)
+    if [ -f "$XDG_CONF" ] && [ -f "$LEGACY_CONF" ]; then
+        echo "[FAIL] Split-brain config: both ${LEGACY_CONF} and ${XDG_CONF} exist (tmux reads ${LEGACY_CONF}, TPM reads ${XDG_CONF})"
+        failures=$((failures + 1))
+    else
+        echo "[PASS] Single tmux config path resolved: ${tmux_conf}"
+    fi
+
     if grep -q "# BEGIN TMUX-PHOENIX" "$tmux_conf" 2>/dev/null; then
         echo "[PASS] Managed block present in ${tmux_conf}"
     else
@@ -491,6 +516,15 @@ cmd_doctor() {
             echo "[PASS] destroy-unattached is off"
         else
             echo "[FAIL] destroy-unattached is '${destroy_opt}' (must be 'off')"
+            failures=$((failures + 1))
+        fi
+
+        local status_right
+        status_right=$(tmux show-options -gv status-right 2>/dev/null || true)
+        if [[ "$status_right" == *"continuum_save.sh"* ]]; then
+            echo "[PASS] tmux-continuum hook active in status-right"
+        else
+            echo "[FAIL] tmux-continuum hook missing from status-right (TPM did not load tmux-continuum)"
             failures=$((failures + 1))
         fi
     else
@@ -539,7 +573,7 @@ cmd_setup() {
 
     echo "[3/5] Resolving and configuring tmux configuration file..."
     local tmux_conf
-    tmux_conf=$(resolve_tmux_conf)
+    tmux_conf=$(reconcile_tmux_conf)
     echo "Using configuration file: ${tmux_conf}"
     mkdir -p "$(dirname "$tmux_conf")"
     touch "$tmux_conf"
@@ -560,6 +594,7 @@ set -g @plugin 'tmux-plugins/tpm'
 set -g @plugin 'tmux-plugins/tmux-resurrect'
 set -g @plugin 'tmux-plugins/tmux-continuum'
 
+set -g @continuum-boot 'on'
 set -g @continuum-restore 'on'
 set -g @continuum-save-interval '${SAVE_INTERVAL}'
 set -g @resurrect-processes '${RESURRECT_PROCESSES}'
