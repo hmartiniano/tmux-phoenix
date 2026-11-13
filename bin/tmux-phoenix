@@ -721,8 +721,10 @@ case "${1:-status}" in
         prune_snapshots "$KEEP_SNAPSHOTS"
         ;;
     _hook-post-start)
-        sleep 7
-        if [ "$(count_real_sessions)" -gt 0 ]; then
+        sleep 3
+        if [ "$(count_real_sessions)" -eq 0 ] && get_last_snapshot >/dev/null 2>&1; then
+            cmd_restore >/dev/null 2>&1 || true
+        elif [ "$(count_real_sessions)" -gt 0 ]; then
             tmux kill-session -t "$AUTOSTART_SESSION" 2>/dev/null || true
         fi
         ;;
