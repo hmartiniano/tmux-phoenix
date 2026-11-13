@@ -23,13 +23,13 @@ Zero-loss `tmux` session persistence, crash recovery, and snapshot management fo
 ```bash
 git clone https://github.com/hmartiniano/tmux-phoenix.git
 cd tmux-phoenix
-./install.sh
+make install
 ```
 
-`install.sh` symlinks `tmux-phoenix` and `tpx` into `~/.local/bin` and runs `tmux-phoenix setup`. To install to a custom prefix:
+`make install` runs `install.sh`, which symlinks `tmux-phoenix` and `tpx` into `~/.local/bin` and runs `tmux-phoenix setup` (you can also run `./install.sh` directly if `make` is not installed). To install to a custom prefix:
 
 ```bash
-PREFIX=/usr/local ./install.sh
+make install PREFIX=/usr/local
 ```
 
 ## Configuration
