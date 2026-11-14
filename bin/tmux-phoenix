@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 
 # Default configuration (overridable via ~/.config/tmux-phoenix/config)
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/tmux-phoenix/config"
