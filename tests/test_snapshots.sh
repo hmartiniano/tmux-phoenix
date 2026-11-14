@@ -106,4 +106,60 @@ ln -sf "$(basename "$PINNED_SNAP")" "${RESURRECT_DIR}/last"
     exit 1
 }
 
+# 7. Verify 'edit' rejects an empty WORKING_DIRECTORY column without touching 'last'
+SNAP_BEFORE_EMPTY_DIR=$(readlink -f "${RESURRECT_DIR}/last")
+EMPTY_DIR_EDITOR="${TMP_HOME}/empty_dir_editor.sh"
+cat << 'EOF' > "$EMPTY_DIR_EDITOR"
+#!/usr/bin/env bash
+printf 'work:0.0\t\tpython3 missing_dir.py\n' > "$1"
+EOF
+chmod +x "$EMPTY_DIR_EDITOR"
+if EDITOR="$EMPTY_DIR_EDITOR" "$PHOENIX" edit 2>/dev/null; then
+    echo "FAIL: 'edit' should have failed on empty directory column"
+    exit 1
+fi
+[ "$(readlink -f "${RESURRECT_DIR}/last")" = "$SNAP_BEFORE_EMPTY_DIR" ] || {
+    echo "FAIL: Empty-directory 'edit' modified the 'last' symlink"
+    exit 1
+}
+
+# 8. Verify 'edit' supports $EDITOR values containing flags/arguments
+ARG_EDITOR="${TMP_HOME}/arg_editor.sh"
+cat << 'EOF' > "$ARG_EDITOR"
+#!/usr/bin/env bash
+[ "$1" = "--flag" ] || exit 1
+printf 'work:0.0\t/opt/jobs\techo with_args\n' > "$2"
+EOF
+chmod +x "$ARG_EDITOR"
+EDITOR="${ARG_EDITOR} --flag" "$PHOENIX" edit
+"$PHOENIX" list | grep -q "/opt/jobs" || { echo "FAIL: \$EDITOR with arguments did not update directory"; exit 1; }
+
+# 9. Verify custom XDG_DATA_HOME snapshot directory resolution and pruning
+CUSTOM_DATA_HOME="${TMP_HOME}/custom_data"
+CUSTOM_RESURRECT="${CUSTOM_DATA_HOME}/tmux/resurrect"
+mkdir -p "$CUSTOM_RESURRECT"
+printf 'pane\tcustom\t0\t1\t:*\t0\tbash\t:/tmp\t1\tbash\t:\n' > "${CUSTOM_RESURRECT}/tmux_resurrect_20261114T090000.txt"
+ln -sf "tmux_resurrect_20261114T090000.txt" "${CUSTOM_RESURRECT}/last"
+XDG_DATA_HOME="$CUSTOM_DATA_HOME" "$PHOENIX" list | grep -q "custom:0.0" || {
+    echo "FAIL: Custom XDG_DATA_HOME snapshot was not resolved"
+    exit 1
+}
+
+# 10. Verify reconcile_tmux_conf cleans up boilerplate XDG duplicates and backs up conflicting custom XDG configs
+# shellcheck source=../bin/tmux-phoenix
+source "$PHOENIX"
+mkdir -p "$(dirname "$XDG_CONF")"
+printf 'set -g mouse on\n' > "$LEGACY_CONF"
+printf '# comment\nset -g @plugin '\''tmux-plugins/tpm'\''\nset -g @plugin '\''tmux-plugins/tmux-sensible'\''\nrun '\''~/.tmux/plugins/tpm/tpm'\''\n' > "$XDG_CONF"
+# Note: non-boilerplate plugin lines in XDG_CONF should be backed up to .bak rather than deleted
+RESOLVED=$(reconcile_tmux_conf 2>/dev/null)
+[ "$RESOLVED" = "$LEGACY_CONF" ] || { echo "FAIL: Expected $LEGACY_CONF, got $RESOLVED"; exit 1; }
+[ ! -f "$XDG_CONF" ] && [ -f "${XDG_CONF}.bak" ] || { echo "FAIL: Conflicting XDG config was not backed up"; exit 1; }
+
+rm -f "${XDG_CONF}.bak"
+printf 'run '\''~/.tmux/plugins/tpm/tpm'\''\n' > "$XDG_CONF"
+RESOLVED=$(reconcile_tmux_conf)
+[ "$RESOLVED" = "$LEGACY_CONF" ] || { echo "FAIL: Expected $LEGACY_CONF after boilerplate removal"; exit 1; }
+[ ! -e "$XDG_CONF" ] && [ ! -e "${XDG_CONF}.bak" ] || { echo "FAIL: Boilerplate XDG config was not removed cleanly"; exit 1; }
+
 echo "All tests passed."

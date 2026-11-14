@@ -28,17 +28,19 @@ SERVICE_FILE="${SYSTEMD_USER_DIR}/tmux.service"
 
 XDG_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf"
 LEGACY_CONF="${HOME}/.tmux.conf"
+XDG_RESURRECT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect"
+LEGACY_RESURRECT_DIR="${HOME}/.tmux/resurrect"
 DEFAULT_SHELL_NAME=$(basename "${SHELL:-bash}")
 
 get_snapshot_dir() {
-    local last_link
-    last_link=$(ls -d "${HOME}/.local/share/tmux/resurrect/last" "${HOME}/.tmux/resurrect/last" 2>/dev/null | head -n 1 || true)
-    if [ -n "$last_link" ]; then
-        dirname "$last_link"
-    elif [ -d "${HOME}/.local/share/tmux/resurrect" ]; then
-        echo "${HOME}/.local/share/tmux/resurrect"
+    if [ -L "${LEGACY_RESURRECT_DIR}/last" ] || [ -e "${LEGACY_RESURRECT_DIR}/last" ]; then
+        echo "$LEGACY_RESURRECT_DIR"
+    elif [ -L "${XDG_RESURRECT_DIR}/last" ] || [ -e "${XDG_RESURRECT_DIR}/last" ]; then
+        echo "$XDG_RESURRECT_DIR"
+    elif [ -d "$LEGACY_RESURRECT_DIR" ]; then
+        echo "$LEGACY_RESURRECT_DIR"
     else
-        echo "${HOME}/.tmux/resurrect"
+        echo "$XDG_RESURRECT_DIR"
     fi
 }
 
@@ -61,9 +63,9 @@ run_resurrect_save() {
 prune_snapshots() {
     local keep="${1:-$KEEP_SNAPSHOTS}"
     local tail_start=$((keep + 1))
-    local d active latest f removed=0
+    local d active latest f mtime_ref removed=0
 
-    for d in "${HOME}/.local/share/tmux/resurrect" "${HOME}/.tmux/resurrect"; do
+    for d in "$LEGACY_RESURRECT_DIR" "$XDG_RESURRECT_DIR"; do
         [ -d "$d" ] || continue
 
         # Remove scrollback archive and staging folder when scrollback capture is disabled
@@ -75,12 +77,13 @@ prune_snapshots() {
         while IFS= read -r f; do
             [ -n "$f" ] || continue
             if grep -q -E "^(pane|window)[[:space:]]+${AUTOSTART_SESSION}[[:space:]]+" "$f" 2>/dev/null; then
-                touch -r "$f" "${d}/.mtime_ref"
+                mtime_ref=$(mktemp "${d}/.mtime_ref.XXXXXX")
+                touch -r "$f" "$mtime_ref"
                 sed -i -E "/^(pane|window)\t${AUTOSTART_SESSION}\t/d" "$f"
-                touch -r "${d}/.mtime_ref" "$f"
-                rm -f "${d}/.mtime_ref"
+                touch -r "$mtime_ref" "$f"
+                rm -f "$mtime_ref"
             fi
-            if ! grep -q -E "^pane	" "$f" 2>/dev/null; then
+            if ! grep -q $'^pane\t' "$f" 2>/dev/null; then
                 rm -f "$f"
             fi
         done < <(find "$d" -maxdepth 1 -name 'tmux_resurrect_*.txt' -size +0c 2>/dev/null)
@@ -141,6 +144,9 @@ validate_snapshot() {
         }
         if (substr($8, 1, 1) != ":") {
             printf "Line %d: directory field ($8) is missing leading colon (:).\n", NR > "/dev/stderr"
+            err = 1
+        } else if (length($8) < 2) {
+            printf "Line %d: directory field ($8) is empty.\n", NR > "/dev/stderr"
             err = 1
         }
         if (substr($11, 1, 1) != ":") {
@@ -359,10 +365,12 @@ EOF
 
     before_hash=$(sha256sum "$tmp_edit" | awk '{print $1}')
     editor="${EDITOR:-nvim}"
-    if [[ "$editor" == *vim* ]]; then
-        "$editor" -c "set noexpandtab list" "$tmp_edit"
+    local -a editor_cmd
+    read -r -a editor_cmd <<< "$editor"
+    if [[ "${editor_cmd[0]}" == *vim* ]]; then
+        "${editor_cmd[@]}" -c "set noexpandtab list" "$tmp_edit"
     else
-        "$editor" "$tmp_edit"
+        "${editor_cmd[@]}" "$tmp_edit"
     fi
     after_hash=$(sha256sum "$tmp_edit" | awk '{print $1}')
 
@@ -569,11 +577,13 @@ cmd_setup() {
     done
     chmod +x "${PLUGIN_BASE}/tpm/tpm" "${PLUGIN_BASE}/tpm/scripts/"*.sh \
         "${PLUGIN_BASE}/tmux-resurrect/"*.tmux "${PLUGIN_BASE}/tmux-resurrect/scripts/"*.sh \
+        "${PLUGIN_BASE}/tmux-resurrect/strategies/"*.sh "${PLUGIN_BASE}/tmux-resurrect/save_command_strategies/"*.sh \
         "${PLUGIN_BASE}/tmux-continuum/"*.tmux "${PLUGIN_BASE}/tmux-continuum/scripts/"*.sh 2>/dev/null || true
 
     echo "[3/5] Resolving and configuring tmux configuration file..."
-    local tmux_conf
+    local tmux_conf tmux_bin
     tmux_conf=$(reconcile_tmux_conf)
+    tmux_bin=$(command -v tmux)
     echo "Using configuration file: ${tmux_conf}"
     mkdir -p "$(dirname "$tmux_conf")"
     touch "$tmux_conf"
@@ -581,11 +591,15 @@ cmd_setup() {
     sed -i '/# BEGIN TMUX-PHOENIX/,/# END TMUX-PHOENIX/d' "$tmux_conf"
     sed -i '/# BEGIN TMUX PERSISTENCE/,/# END TMUX PERSISTENCE/d' "$tmux_conf"
     sed -i '/TMUX_PLUGIN_MANAGER_PATH/d; /destroy-unattached/d; /exit-unattached/d' "$tmux_conf"
-    sed -i "\|run '~/.tmux/plugins/tpm/tpm'|d" "$tmux_conf"
-    sed -i '\|run "~/.tmux/plugins/tpm/tpm"|d' "$tmux_conf"
+    sed -i -E '/^[[:space:]]*run(-shell)?([[:space:]]+-b)?[[:space:]]+.*tpm\/tpm/d' "$tmux_conf"
+    awk '{ lines[NR] = $0 } END { while (NR > 0 && lines[NR] ~ /^[[:space:]]*$/) NR--; for (i = 1; i <= NR; i++) print lines[i] }' "$tmux_conf" > "${tmux_conf}.tmp"
+    mv -f "${tmux_conf}.tmp" "$tmux_conf"
+
+    if [ -s "$tmux_conf" ]; then
+        printf '\n' >> "$tmux_conf"
+    fi
 
     cat << EOF >> "$tmux_conf"
-
 # BEGIN TMUX-PHOENIX
 set -g destroy-unattached off
 set -g exit-unattached off
@@ -600,8 +614,8 @@ set -g @continuum-save-interval '${SAVE_INTERVAL}'
 set -g @resurrect-processes '${RESURRECT_PROCESSES}'
 set -g @resurrect-capture-pane-contents '${CAPTURE_PANE_CONTENTS}'
 set -g @resurrect-hook-post-save-all '${SELF_BIN} _hook-post-save'
-# END TMUX-PHOENIX
 run '~/.tmux/plugins/tpm/tpm'
+# END TMUX-PHOENIX
 EOF
 
     echo "[4/5] Pruning snapshots and syncing active tmux server..."
@@ -612,6 +626,12 @@ EOF
             tmux set-hook -gu "$hook" 2>/dev/null || true
         done
         tmux source-file "$tmux_conf"
+        if [ "$(count_real_sessions)" -gt 0 ]; then
+            if run_resurrect_save; then
+                prune_snapshots "$KEEP_SNAPSHOTS"
+                echo "Saved active sessions prior to service reload."
+            fi
+        fi
     fi
 
     echo "[5/5] Configuring systemd user service, user lingering, and restoring sessions..."
@@ -631,9 +651,9 @@ Type=oneshot
 RemainAfterExit=yes
 Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
 ExecStartPre=${SELF_BIN} _hook-pre-start
-ExecStart=/bin/sh -c '/usr/bin/tmux has-session -t ${AUTOSTART_SESSION} 2>/dev/null || /usr/bin/tmux new-session -d -s ${AUTOSTART_SESSION}'
+ExecStart=/bin/sh -c '${tmux_bin} has-session -t ${AUTOSTART_SESSION} 2>/dev/null || ${tmux_bin} new-session -d -s ${AUTOSTART_SESSION}'
 ExecStartPost=${SELF_BIN} _hook-post-start
-ExecStop=/bin/sh -c '/usr/bin/tmux kill-server 2>/dev/null || true'
+ExecStop=/bin/sh -c '${tmux_bin} kill-server 2>/dev/null || true'
 
 [Install]
 WantedBy=default.target
@@ -666,6 +686,12 @@ EOF
 }
 
 cmd_uninstall() {
+    if tmux list-sessions >/dev/null 2>&1 && [ "$(count_real_sessions)" -gt 0 ]; then
+        echo "Saving active sessions before stopping tmux.service..."
+        run_resurrect_save || true
+        prune_snapshots "$KEEP_SNAPSHOTS" || true
+    fi
+
     echo "Disabling and removing tmux.service..."
     systemctl --user disable --now tmux.service 2>/dev/null || true
     rm -f "$SERVICE_FILE"
@@ -676,63 +702,66 @@ cmd_uninstall() {
     if [ -f "$tmux_conf" ]; then
         sed -i '/# BEGIN TMUX-PHOENIX/,/# END TMUX-PHOENIX/d' "$tmux_conf"
         sed -i '/# BEGIN TMUX PERSISTENCE/,/# END TMUX PERSISTENCE/d' "$tmux_conf"
+        sed -i -E '/^[[:space:]]*run(-shell)?([[:space:]]+-b)?[[:space:]]+.*tpm\/tpm/d' "$tmux_conf"
         echo "Removed managed configuration block from ${tmux_conf}."
     fi
 
     echo "Uninstall complete. Snapshot files in $(get_snapshot_dir) were preserved."
 }
 
-case "${1:-status}" in
-    setup|install)
-        cmd_setup
-        ;;
-    uninstall)
-        cmd_uninstall
-        ;;
-    restore)
-        cmd_restore
-        ;;
-    save)
-        cmd_save
-        ;;
-    prune)
-        prune_snapshots "${2:-$KEEP_SNAPSHOTS}"
-        ;;
-    list|ls)
-        cmd_list
-        ;;
-    set)
-        shift
-        cmd_set "$@"
-        ;;
-    edit)
-        cmd_edit
-        ;;
-    status)
-        cmd_status
-        ;;
-    doctor)
-        cmd_doctor
-        ;;
-    version|--version|-v)
-        echo "tmux-phoenix ${VERSION}"
-        ;;
-    _hook-pre-start)
-        prune_snapshots "$KEEP_SNAPSHOTS"
-        ;;
-    _hook-post-start)
-        sleep 3
-        if [ "$(count_real_sessions)" -eq 0 ] && get_last_snapshot >/dev/null 2>&1; then
-            cmd_restore >/dev/null 2>&1 || true
-        elif [ "$(count_real_sessions)" -gt 0 ]; then
-            tmux kill-session -t "$AUTOSTART_SESSION" 2>/dev/null || true
-        fi
-        ;;
-    _hook-post-save)
-        prune_snapshots "$KEEP_SNAPSHOTS"
-        ;;
-    *)
-        echo "Usage: ${0##*/} {setup|uninstall|restore|save|prune|list|set|edit|status|doctor|version}" >&2
-        exit 1
-        ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    case "${1:-status}" in
+        setup|install)
+            cmd_setup
+            ;;
+        uninstall)
+            cmd_uninstall
+            ;;
+        restore)
+            cmd_restore
+            ;;
+        save)
+            cmd_save
+            ;;
+        prune)
+            prune_snapshots "${2:-$KEEP_SNAPSHOTS}"
+            ;;
+        list|ls)
+            cmd_list
+            ;;
+        set)
+            shift
+            cmd_set "$@"
+            ;;
+        edit)
+            cmd_edit
+            ;;
+        status)
+            cmd_status
+            ;;
+        doctor)
+            cmd_doctor
+            ;;
+        version|--version|-v)
+            echo "tmux-phoenix ${VERSION}"
+            ;;
+        _hook-pre-start)
+            prune_snapshots "$KEEP_SNAPSHOTS"
+            ;;
+        _hook-post-start)
+            sleep 3
+            if [ "$(count_real_sessions)" -eq 0 ] && get_last_snapshot >/dev/null 2>&1; then
+                cmd_restore >/dev/null || true
+            elif [ "$(count_real_sessions)" -gt 0 ]; then
+                tmux kill-session -t "$AUTOSTART_SESSION" 2>/dev/null || true
+            fi
+            ;;
+        _hook-post-save)
+            prune_snapshots "$KEEP_SNAPSHOTS"
+            ;;
+        *)
+            echo "Usage: ${0##*/} {setup|uninstall|restore|save|prune|list|set|edit|status|doctor|version}" >&2
+            exit 1
+            ;;
+    esac
+fi
