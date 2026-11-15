@@ -162,4 +162,70 @@ RESOLVED=$(reconcile_tmux_conf)
 [ "$RESOLVED" = "$LEGACY_CONF" ] || { echo "FAIL: Expected $LEGACY_CONF after boilerplate removal"; exit 1; }
 [ ! -e "$XDG_CONF" ] && [ ! -e "${XDG_CONF}.bak" ] || { echo "FAIL: Boilerplate XDG config was not removed cleanly"; exit 1; }
 
+# 11. Verify 'setup' preserves active tmux sessions without stopping tmux.service (unless --restart)
+(
+    export TMUX_TMPDIR="${TMP_HOME}/tmux_tmp"
+    mkdir -p "$TMUX_TMPDIR" "${TMP_HOME}/mock_bin"
+    unset TMUX
+
+    for repo in tpm tmux-resurrect tmux-continuum; do
+        mkdir -p "${TMP_HOME}/.tmux/plugins/${repo}/scripts"
+    done
+    printf '#!/usr/bin/env bash\nexit 0\n' > "${TMP_HOME}/.tmux/plugins/tpm/tpm"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "${TMP_HOME}/.tmux/plugins/tmux-resurrect/scripts/save.sh"
+    chmod +x "${TMP_HOME}/.tmux/plugins/tpm/tpm" "${TMP_HOME}/.tmux/plugins/tmux-resurrect/scripts/save.sh"
+
+    SYSTEMCTL_LOG="${TMP_HOME}/systemctl.log"
+    cat << EOF > "${TMP_HOME}/mock_bin/systemctl"
+#!/usr/bin/env bash
+echo "\$*" >> "$SYSTEMCTL_LOG"
+exit 0
+EOF
+    cat << 'EOF' > "${TMP_HOME}/mock_bin/loginctl"
+#!/usr/bin/env bash
+echo "yes"
+EOF
+    cat << 'EOF' > "${TMP_HOME}/mock_bin/git"
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "${TMP_HOME}/mock_bin/systemctl" "${TMP_HOME}/mock_bin/loginctl" "${TMP_HOME}/mock_bin/git"
+
+    tmux new-session -d -s live_agent
+    PATH="${TMP_HOME}/mock_bin:${PATH}" "$PHOENIX" setup >/dev/null
+
+    tmux has-session -t live_agent 2>/dev/null || {
+        echo "FAIL: Live tmux session was interrupted during setup"
+        tmux kill-server 2>/dev/null || true
+        exit 1
+    }
+    if grep -q -- "--user stop tmux.service" "$SYSTEMCTL_LOG"; then
+        echo "FAIL: setup stopped tmux.service while real sessions were running"
+        tmux kill-server 2>/dev/null || true
+        exit 1
+    fi
+    grep -q -- "--user daemon-reload" "$SYSTEMCTL_LOG" || {
+        echo "FAIL: setup did not reload systemd user daemon"
+        tmux kill-server 2>/dev/null || true
+        exit 1
+    }
+    grep -q -- "--user enable tmux.service" "$SYSTEMCTL_LOG" || {
+        echo "FAIL: setup did not enable tmux.service"
+        tmux kill-server 2>/dev/null || true
+        exit 1
+    }
+    [ -f "${TMP_HOME}/.config/systemd/user/tmux.service" ] || {
+        echo "FAIL: tmux.service unit file was not written"
+        tmux kill-server 2>/dev/null || true
+        exit 1
+    }
+    grep -q "# BEGIN TMUX-PHOENIX" "$LEGACY_CONF" || {
+        echo "FAIL: Managed block missing in $LEGACY_CONF after setup"
+        tmux kill-server 2>/dev/null || true
+        exit 1
+    }
+
+    tmux kill-server 2>/dev/null || true
+)
+
 echo "All tests passed."

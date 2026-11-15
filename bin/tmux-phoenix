@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-VERSION="0.1.1"
+VERSION="0.1.2"
 
 # Default configuration (overridable via ~/.config/tmux-phoenix/config)
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/tmux-phoenix/config"
@@ -555,6 +555,16 @@ cmd_doctor() {
 }
 
 cmd_setup() {
+    local force_restart=0
+    case "${1:-}" in
+        "") ;;
+        --restart) force_restart=1 ;;
+        *)
+            echo "Usage: ${0##*/} setup [--restart]" >&2
+            exit 1
+            ;;
+    esac
+
     echo "[1/5] Checking dependencies..."
     for cmd in git tmux systemctl loginctl sed find awk; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -637,7 +647,12 @@ EOF
     echo "[5/5] Configuring systemd user service, user lingering, and restoring sessions..."
     mkdir -p "$SYSTEMD_USER_DIR"
 
-    systemctl --user stop tmux.service 2>/dev/null || true
+    local real_sessions
+    real_sessions=$(count_real_sessions)
+
+    if [ "$real_sessions" -eq 0 ] || [ "$force_restart" -eq 1 ]; then
+        systemctl --user stop tmux.service 2>/dev/null || true
+    fi
     systemctl --user reset-failed tmux.service 2>/dev/null || true
 
     cat << EOF > "$SERVICE_FILE"
@@ -660,18 +675,27 @@ WantedBy=default.target
 EOF
 
     systemctl --user daemon-reload
-    systemctl --user enable --now tmux.service
 
-    local real_sessions
-    real_sessions=$(count_real_sessions)
+    if [ "$real_sessions" -gt 0 ] && [ "$force_restart" -eq 0 ]; then
+        if systemctl --user is-active tmux.service >/dev/null 2>&1; then
+            systemctl --user enable tmux.service
+        else
+            systemctl --user enable --now tmux.service
+        fi
+        echo "Active tmux sessions detected; updated tmux.service and reloaded config without interrupting running sessions."
+    else
+        systemctl --user enable --now tmux.service
 
-    if [ "$real_sessions" -eq 0 ] && get_last_snapshot >/dev/null 2>&1; then
-        echo "Valid snapshot found and no real sessions active. Restoring saved sessions..."
-        cmd_restore
-    elif [ "$real_sessions" -gt 0 ]; then
-        if run_resurrect_save; then
-            prune_snapshots "$KEEP_SNAPSHOTS"
-            echo "Saved active sessions to snapshot."
+        real_sessions=$(count_real_sessions)
+
+        if [ "$real_sessions" -eq 0 ] && get_last_snapshot >/dev/null 2>&1; then
+            echo "Valid snapshot found and no real sessions active. Restoring saved sessions..."
+            cmd_restore
+        elif [ "$real_sessions" -gt 0 ]; then
+            if run_resurrect_save; then
+                prune_snapshots "$KEEP_SNAPSHOTS"
+                echo "Saved active sessions to snapshot."
+            fi
         fi
     fi
 
@@ -712,7 +736,8 @@ cmd_uninstall() {
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     case "${1:-status}" in
         setup|install)
-            cmd_setup
+            shift
+            cmd_setup "${1:-}"
             ;;
         uninstall)
             cmd_uninstall

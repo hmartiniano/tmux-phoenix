@@ -58,6 +58,7 @@ Re-run `tmux-phoenix setup` after changing configuration values.
 
 ```bash
 # Install or update plugins, tmux.conf hooks, and the systemd user service
+# (preserves active tmux sessions; pass --restart to force-restart tmux.service)
 tmux-phoenix setup
 
 # Show systemd service health, plugin path, active sessions, and snapshot table
